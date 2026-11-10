@@ -48,36 +48,61 @@ fn connect() -> Result<RpcConn, Error> {
     Ok(RpcConn::new(DuplexConn::connect_to_bus(UnixAddr::new(SOCKET)?, false)?))
 }
 
-fn call<A: Marshal + Signature>(
-    conn: &mut RpcConn,
-    method: &str,
-    arg: Option<A>,
-) -> Result<rustbus::message_builder::MarshalledMessage, Error> {
+type Reply = rustbus::message_builder::MarshalledMessage;
+
+fn send<A: Marshal + Signature>(conn: &mut RpcConn, method: &str, arg: Option<A>) -> Result<u32, Error> {
     let mut msg = MessageBuilder::new().call(method).on(PATH).with_interface(MANAGER).build();
     if let Some(arg) = arg {
         msg.body.push_param(arg)?;
     }
-    let serial = conn.send_message(&mut msg)?.write_all().map_err(force_finish_on_error)?;
-    let reply = conn.wait_response(serial, TIMEOUT)?;
-    // A job that ended between two calls answers with an error, which is not a broken connection.
-    if reply.typ == MessageType::Error { Err(Error::TimedOut) } else { Ok(reply) }
+    conn.send_message(&mut msg)?.write_all().map_err(force_finish_on_error)
 }
 
-fn jobs(conn: &mut RpcConn, method: &str, id: Option<u32>) -> Result<Vec<JobEntry>, Error> {
-    Ok(call(conn, method, id)?.body.parser().get()?)
+/// `None` for an error reply: a job that ended between two calls is not a broken connection.
+fn receive(conn: &mut RpcConn, serial: u32) -> Result<Option<Reply>, Error> {
+    let reply = conn.wait_response(serial, TIMEOUT)?;
+    Ok((reply.typ != MessageType::Error).then_some(reply))
+}
+
+fn list_jobs(conn: &mut RpcConn) -> Result<Vec<JobEntry>, Error> {
+    let serial = send(conn, "ListJobs", None::<u32>)?;
+    Ok(receive(conn, serial)?.ok_or(Error::TimedOut)?.body.parser().get()?)
+}
+
+/// The jobs each of `ids` waits for. Every call is written before the first reply is read, so
+/// the sweep costs PID 1 one pass over its socket, not a round trip per job.
+fn blockers(conn: &mut RpcConn, ids: &[u32]) -> Result<Vec<(u32, Vec<u32>)>, Error> {
+    let serials: Vec<u32> = ids.iter().map(|&id| send(conn, "GetJobBefore", Some(id))).collect::<Result<_, _>>()?;
+    let mut out = Vec::new();
+    for (&id, serial) in ids.iter().zip(serials) {
+        if let Some(reply) = receive(conn, serial)? {
+            let before: Vec<JobEntry> = reply.body.parser().get()?;
+            out.push((id, before.into_iter().map(|j| j.id).collect()));
+        }
+    }
+    Ok(out)
 }
 
 fn failed(conn: &mut RpcConn) -> Result<Vec<String>, Error> {
-    let units: Vec<UnitEntry> = call(conn, "ListUnitsFiltered", Some(vec!["failed"]))?.body.parser().get()?;
+    let serial = send(conn, "ListUnitsFiltered", Some(vec!["failed"]))?;
+    let units: Vec<UnitEntry> = receive(conn, serial)?.ok_or(Error::TimedOut)?.body.parser().get()?;
     Ok(units.into_iter().map(|u| u.name).collect())
 }
 
+/// The last two lines the journal has for the unit that say something the row does not.
 fn journal(unit: &str) -> Vec<String> {
-    let out = Command::new("journalctl").args(["-b", "-u", unit, "-n", "2", "-o", "cat", "--no-pager", "-q"]).output();
+    let out = Command::new("journalctl").args(["-b", "-u", unit, "-n", "8", "-o", "cat", "--no-pager", "-q"]).output();
     let Ok(out) = out else { return Vec::new() };
-    // systemd's own lines about a unit open with its name, which the row above already gives.
     let own = format!("{unit}: ");
-    String::from_utf8_lossy(&out.stdout).lines().map(|l| l.strip_prefix(&own).unwrap_or(l).to_string()).collect()
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut lines: Vec<String> = text
+        .lines()
+        .map(|l| l.strip_prefix(&own).unwrap_or(l))
+        .filter(|l| !l.starts_with("Failed to start ") && !l.starts_with("Failed with result "))
+        .map(str::to_string)
+        .collect();
+    lines.drain(..lines.len().saturating_sub(2));
+    lines
 }
 
 /// Polls PID 1 and sends a snapshot whenever one differs from the last. The connection drops
@@ -93,35 +118,32 @@ pub fn watch(tx: Sender<Snapshot>, shutdown: bool) {
             continue;
         };
         let mut waits: HashMap<u32, Vec<u32>> = HashMap::new();
-        let mut ids: HashSet<u32> = HashSet::new();
-        let mut stale = true;
-        let mut edges_at: Option<Instant> = None;
+        let mut swept: Option<Instant> = None;
         let mut failed_at: Option<Instant> = None;
-        while let Ok(list) = jobs(&mut conn, "ListJobs", None) {
-            let now: HashSet<u32> = list.iter().map(|j| j.id).collect();
-            if now != ids {
-                stale = true;
-                waits.retain(|id, _| now.contains(id));
-                for after in waits.values_mut() {
-                    after.retain(|id| now.contains(id));
+        while let Ok(list) = list_jobs(&mut conn) {
+            let ids: HashSet<u32> = list.iter().map(|j| j.id).collect();
+            waits.retain(|id, _| ids.contains(id));
+            let waiting: Vec<u32> = list.iter().filter(|j| j.state != "running").map(|j| j.id).collect();
+            // A job's blockers are asked for once, when it first shows. One enqueued later can
+            // come to block a job already asked about, which a sweep of them all picks up.
+            let sweep = swept.is_none_or(|t| t.elapsed() >= Duration::from_secs(2));
+            let ask: Vec<u32> = waiting.iter().copied().filter(|id| sweep || !waits.contains_key(id)).collect();
+            if !ask.is_empty() {
+                let Ok(found) = blockers(&mut conn, &ask) else { break };
+                waits.extend(found);
+                if sweep {
+                    swept = Some(Instant::now());
                 }
-                ids = now;
             }
-            // One call per waiting job, to a PID 1 that is busy booting: no more than twice a second.
-            if stale && edges_at.is_none_or(|t| t.elapsed() >= Duration::from_millis(500)) {
-                for job in list.iter().filter(|j| j.state != "running") {
-                    if let Ok(after) = jobs(&mut conn, "GetJobBefore", Some(job.id)) {
-                        waits.insert(job.id, after.into_iter().map(|j| j.id).filter(|id| ids.contains(id)).collect());
-                    }
-                }
-                stale = false;
-                edges_at = Some(Instant::now());
+            for before in waits.values_mut() {
+                before.retain(|id| ids.contains(id));
             }
             if failed_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
                 failed_at = Some(Instant::now());
                 if let Ok(units) = failed(&mut conn) {
                     let skip = ignored
                         .get_or_insert_with(|| if shutdown { units.iter().cloned().collect() } else { HashSet::new() });
+                    failures.retain(|f| units.contains(&f.unit));
                     for unit in units {
                         if !skip.contains(&unit) && !failures.iter().any(|f| f.unit == unit) {
                             failures.push(Failure { lines: journal(&unit), unit });
@@ -140,7 +162,7 @@ pub fn watch(tx: Sender<Snapshot>, shutdown: bool) {
                     return;
                 }
             }
-            std::thread::sleep(Duration::from_millis(200));
+            std::thread::sleep(Duration::from_millis(100));
         }
     }
 }
