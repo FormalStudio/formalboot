@@ -63,12 +63,14 @@ pub fn label(unit: &str) -> String {
 struct Node {
     job: usize,
     kids: Vec<Node>,
-    active: bool,
+    running: bool,
 }
 
 /// The pending jobs as a tree: a job's children are the jobs it waits for. A job that several
-/// wait for hangs under the one nearest a root, and a waiting job with a single child gives its
-/// place to that child, so the rows are the roots, the branch points and what is running.
+/// wait for hangs under the one nearest a root. Only what leads to a running job is a row: a
+/// waiting job nothing runs under is left out, and one with a single child gives its place to
+/// that child unless it is a root, so the rows are what runs, under the roots and branch points
+/// waiting on it.
 pub fn rows(snap: &Snapshot) -> Vec<Row> {
     let index: HashMap<u32, usize> = snap.jobs.iter().enumerate().map(|(i, j)| (j.id, i)).collect();
     let awaited: HashSet<u32> = snap.waits.values().flatten().copied().collect();
@@ -94,15 +96,14 @@ pub fn rows(snap: &Snapshot) -> Vec<Row> {
     fn build(i: usize, root: bool, snap: &Snapshot, children: &[Vec<usize>]) -> Vec<Node> {
         let mut kids: Vec<Node> = children[i].iter().flat_map(|&k| build(k, false, snap, children)).collect();
         let running = snap.jobs[i].running;
-        if !(root || running || kids.len() != 1) {
+        if !running && (kids.is_empty() || (kids.len() == 1 && !root)) {
             return kids;
         }
-        kids.sort_by(|a, b| b.active.cmp(&a.active).then_with(|| snap.jobs[a.job].unit.cmp(&snap.jobs[b.job].unit)));
-        let active = running || kids.iter().any(|k| k.active);
-        vec![Node { job: i, kids, active }]
+        kids.sort_by(|a, b| b.running.cmp(&a.running).then_with(|| snap.jobs[a.job].unit.cmp(&snap.jobs[b.job].unit)));
+        vec![Node { job: i, kids, running }]
     }
     let mut top: Vec<Node> = roots.iter().flat_map(|&r| build(r, true, snap, &children)).collect();
-    top.sort_by(|a, b| b.active.cmp(&a.active).then_with(|| snap.jobs[a.job].unit.cmp(&snap.jobs[b.job].unit)));
+    top.sort_by(|a, b| b.running.cmp(&a.running).then_with(|| snap.jobs[a.job].unit.cmp(&snap.jobs[b.job].unit)));
 
     fn flatten(node: &Node, guides: &[bool], last: bool, snap: &Snapshot, out: &mut Vec<Row>) {
         let job = &snap.jobs[node.job];
@@ -220,14 +221,23 @@ mod tests {
     }
 
     #[test]
+    fn a_waiting_job_nothing_runs_under_is_left_out() {
+        let s = snap(
+            vec![job(1, "graphical.target", false), job(2, "idle.service", false), job(3, "busy.service", true)],
+            &[(1, &[2, 3])],
+        );
+        let got: Vec<String> = rows(&s).into_iter().map(|r| r.label).collect();
+        assert_eq!(got, ["graphical.target", "busy"]);
+    }
+
+    #[test]
     fn a_job_awaited_twice_shows_once_and_a_cycle_ends() {
         let s = snap(
             vec![job(1, "a.target", false), job(2, "b.target", false), job(3, "c.service", true)],
             &[(1, &[2, 3]), (2, &[3, 1])],
         );
         let rows = rows(&s);
-        assert_eq!(rows.iter().filter(|r| r.label == "c").count(), 1);
-        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.iter().map(|r| r.label.as_str()).collect::<Vec<_>>(), ["c"]);
     }
 
     #[test]

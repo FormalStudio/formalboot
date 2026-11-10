@@ -49,6 +49,8 @@ pub struct Scene<'a> {
     pub shutdown: bool,
     pub steps: u32,
     pub rows: &'a [Row],
+    /// Every job systemd has queued or running, the rows among them.
+    pub pending: usize,
     /// Seconds each row's job has run, by row.
     pub elapsed: &'a [Option<f32>],
     pub slowest: &'a [(String, f32)],
@@ -164,7 +166,7 @@ pub fn draw(canvas: &mut Canvas, face: &mut Face, theme: &Theme, scene: &Scene) 
         canvas.text(face, &time, (left + width - time_w, baseline(n)), px, theme.muted, o);
         n += 1;
     }
-    let cut = scene.rows.len() - shown;
+    let cut = scene.pending.saturating_sub(shown);
     if cut > 0 && n < lines {
         canvas.text(face, &format!("+{cut} more"), (left, baseline(n)), px, theme.muted, o);
         n += 1;

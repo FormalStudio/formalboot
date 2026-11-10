@@ -49,6 +49,7 @@ pub fn run(theme: Theme, shutdown: bool) -> Result<(), String> {
     let mut paced = start;
     let mut quitting: Option<Instant> = None;
     let mut drawn = None;
+    let mut steps = 0;
 
     loop {
         let now = Instant::now();
@@ -84,9 +85,12 @@ pub fn run(theme: Theme, shutdown: bool) -> Result<(), String> {
         }
 
         let since_quit = quitting.map(|t| now.duration_since(t).as_secs_f32());
-        let steps = match since_quit {
+        // Never backwards: the pace is only known once the real root's record of it can be read.
+        steps = match since_quit {
             Some(_) => STEPS,
-            None => ((start.elapsed().as_secs_f32() / pace.unwrap_or(12.0) * STEPS as f32) as u32).min(STEPS - 1),
+            None => {
+                steps.max(((start.elapsed().as_secs_f32() / pace.unwrap_or(12.0) * STEPS as f32) as u32).min(STEPS - 1))
+            }
         };
         let opacity = lit.map_or(0.0, |t| (now.duration_since(t).as_secs_f32() / FADE_IN).min(1.0));
         let lists = since_quit.map_or(1.0, |t| (1.0 - t / LISTS_OUT).max(0.0));
@@ -100,6 +104,7 @@ pub fn run(theme: Theme, shutdown: bool) -> Result<(), String> {
                 shutdown,
                 steps,
                 rows: &rows,
+                pending: snapshot.jobs.len(),
                 elapsed: &elapsed,
                 slowest: &slowest,
                 failed: &snapshot.failed,
