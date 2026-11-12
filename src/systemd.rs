@@ -45,7 +45,19 @@ type Error = rustbus::connection::Error;
 
 fn connect() -> Result<RpcConn, Error> {
     // No Hello: this is a peer connection to PID 1, not a bus.
-    Ok(RpcConn::new(DuplexConn::connect_to_bus(UnixAddr::new(SOCKET)?, false)?))
+    let mut conn = RpcConn::new(DuplexConn::connect_to_bus(UnixAddr::new(SOCKET)?, false)?);
+    // A call PID 1 reads in one go with the handshake's BEGIN sits unanswered until more bytes
+    // follow it (systemd 261), which a busy PID 1 makes the usual case. The next call's bytes
+    // get both answered, so the first is repeated until one is.
+    let start = Instant::now();
+    loop {
+        let serial = send(&mut conn, "ListJobs", None::<u32>)?;
+        match conn.wait_response(serial, Timeout::Duration(Duration::from_millis(50))) {
+            Ok(_) => return Ok(conn),
+            Err(Error::TimedOut) if start.elapsed() < Duration::from_secs(2) => {}
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 type Reply = rustbus::message_builder::MarshalledMessage;
